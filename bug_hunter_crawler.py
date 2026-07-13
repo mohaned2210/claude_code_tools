@@ -1717,7 +1717,7 @@ class Crawler:
             logger.debug("JS%s %s", " (off-site)" if offsite else "", norm)
 
         resp = self.client.request("GET", norm, kind="script", referer=referer)
-        if not resp or resp.status_code >= 400:
+        if resp is None or resp.status_code >= 400:
             return
 
         try:
@@ -1781,7 +1781,7 @@ class Crawler:
         if not self.scope.in_scope(smap_url):
             return
         resp = self.client.request("GET", smap_url, kind="json", referer=referer)
-        if not resp or resp.status_code >= 400:
+        if resp is None or resp.status_code >= 400:
             with self._lock:
                 self.source_maps.append(SourceMapInfo(
                     url=smap_url, contains_original_source=False,
@@ -1827,7 +1827,7 @@ class Crawler:
             logger.debug("GET %s", norm)
 
         resp = self.client.request("GET", norm, kind="html", referer=referer)
-        if not resp:
+        if resp is None:
             return set()
 
         # Look for JSON / API responses crawled from /api/ etc.
@@ -2018,7 +2018,7 @@ class Crawler:
         target = self._normalise(self.target)
         target_host = (urlparse(target).hostname or "").lower()
         resp = self.client.request("GET", target, kind="html")
-        if not resp:
+        if resp is None:
             if self.evader.is_rate_limited_hard(target_host):
                 logger.error("Target is rate-limiting us — aborting JS-only scan.")
             else:
@@ -2554,6 +2554,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Path prefixes to exclude, comma-separated (e.g. /logout,/delete)")
     p.add_argument("--js-only", action="store_true",
                    help="Only analyse JS files, skip HTML crawling")
+    p.add_argument("--no-smart-paths", "--no-bruteforce", dest="no_smart_paths",
+                   action="store_true",
+                   help="Disable Smart-path discovery — the built-in brute-force probe of "
+                        "common config/admin/debug/backup/leak paths (SMART_PATHS). Only the "
+                        "link crawl + JS analysis run. Use on fragile targets or to avoid "
+                        "hammering a host with wordlist requests.")
     p.add_argument("--verbose", action="store_true", help="Show detailed output while running")
     p.add_argument("--stealth", action="store_true",
                    help="Maximum stealth mode (slow crawl + extra evasion)")
@@ -2689,8 +2695,10 @@ def _run_one_target(
                 target, args.depth, threads)
     try:
         crawler.crawl()
-        if not args.js_only:
+        if not args.js_only and not args.no_smart_paths:
             path_discovery.run()
+        elif args.no_smart_paths and not args.js_only:
+            logger.info("Smart-path discovery disabled (--no-smart-paths).")
     except KeyboardInterrupt:
         logger.warning("Interrupted — writing partial report.")
         # Re-raise to let main() decide whether to continue with remaining targets.
