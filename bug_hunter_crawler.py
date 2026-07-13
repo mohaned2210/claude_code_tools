@@ -389,6 +389,26 @@ JS_LOCALSTORAGE_RE = re.compile(
 JS_SOURCEMAP_RE = re.compile(r"//[#@]\s*sourceMappingURL\s*=\s*([^\s]+)")
 JS_GRAPHQL_RE = re.compile(r"""\b(?:query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)\s*[({]""")
 
+# Broad API-path fragment extractor. A single LINEAR run of path characters — including
+# ${...} template-interpolation and ':' (protocol-relative) — that ends at the first char
+# NOT in the class (any quote, whitespace, comma, paren, operator). One bounded quantifier
+# over an exclusive character class, no nested quantifiers => no catastrophic backtracking,
+# so it is safe to run over multi-MB single-line minified bundles. This catches /api/...
+# embedded in template literals and string concatenations that the quoted-string and
+# leading-slash template regexes miss, e.g.  `${proxy?p:""}/api/v2/${id}`.
+JS_PATH_TOKEN_RE = re.compile(r"/[A-Za-z0-9_.\-/~%:${}]{1,220}")
+
+# Marker gate for the broad scan: only keep path tokens that look like real API / app
+# surface, so a vendor bundle's thousands of library-internal paths don't flood the report.
+# Anchored to a path segment boundary (start or "/") so "video" doesn't match the "v\d" arm.
+_API_PATH_MARKER_RE = re.compile(
+    r"(?:^|/)(?:api|apis|rest|graphql|graphiql|gql|oauth2?|auth|sso|saml|oidc|"
+    r"session|token|refresh|internal|admin|manage|console|debug|actuator|"
+    r"webhooks?|hooks|rpc|jsonrpc|services?|graph|wp-json|_next/data|_api|"
+    r"\.well-known|v[1-9]\d?)(?:/|\?|$)",
+    re.IGNORECASE,
+)
+
 # Parameter-name denylist — these are almost always artefacts of JS minification
 # (Webpack/Terser auto-generated single-letter vars, common runtime helpers, JS
 # keywords that surface as object keys), not real API parameters.
@@ -962,6 +982,16 @@ class JSAnalyzer:
         for m in JS_OBJECT_KEY_RE.finditer(js):
             add(m.group(1))
 
+        # Broad API-path-fragment pass — catches /api/... embedded in template literals,
+        # string concatenations and interpolated URLs that the quoted-string / leading-slash
+        # template regexes above miss (the common case in webpack-minified SPA bundles).
+        for m in JS_PATH_TOKEN_RE.finditer(js):
+            tok = m.group(0)
+            if len(tok) < 4:
+                continue
+            if _API_PATH_MARKER_RE.search(tok):
+                add(tok)
+
         return list(seen.values())
 
     def extract_secrets(self, js: str, source: str) -> List[SecretInfo]:
@@ -1335,6 +1365,43 @@ def _is_image_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _IMAGE_EXTS)
 
 
+# Well-known analytics / advertising / tag-manager / consent hosts. When we're allowed to
+# read an in-scope page's *cross-origin* bundles (off-site policy), these are excluded: they
+# are pure third-party trackers, never the target's own API code, so fetching them just burns
+# the off-site budget and floods the report with other companies' endpoints. Matched as a
+# substring against the hostname.
+_TRACKER_HOST_MARKERS: Tuple[str, ...] = (
+    "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+    "googleadservices.com", "doubleclick.net", "g.doubleclick", "gstatic.com/recaptcha",
+    "connect.facebook.net", "facebook.com/tr", "fbcdn.net",
+    "analytics.tiktok.com", "tr.snapchat.com", "sc-static.net", "ct.pinterest.com",
+    "bat.bing.net", "bing.com", "snap.licdn.com", "licdn.com", "ads-twitter.com",
+    "analytics.twitter.com", "static.ads-twitter.com",
+    # HubSpot marketing/analytics stack (js.hs-*, hsforms, usemessages, hsadspixel, …)
+    "hs-scripts.com", "hs-analytics.net", "hsadspixel.net", "hs-banner.com",
+    "js.hubspot.com", "js-na1.hs-scripts.com", "usemessages.com", "hsforms.",
+    "hscollectedforms.net", "hs-sites.com",
+    # product analytics / session replay / consent
+    "appcues.com", "hotjar.com", "mixpanel.com", "segment.com", "segment.io",
+    "cdn.segment", "fullstory.com", "mouseflow.com", "clarity.ms", "amplitude.com",
+    "quantserve.com", "scorecardresearch.com", "criteo.", "taboola.com", "outbrain.com",
+    "pardot.com", "marketo.net", "mktoresp.com", "cookielaw.org", "onetrust.com",
+    "cookiebot.com", "newrelic.com", "nr-data.net", "browser-intake", "datadoghq",
+)
+
+
+def _is_tracker_host(url: str) -> bool:
+    """True if `url`'s host is a well-known third-party analytics/ad/consent tracker."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    hostpath = host + (urlparse(url).path or "").lower()
+    return any(marker in host or marker in hostpath for marker in _TRACKER_HOST_MARKERS)
+
+
 # Pseudo-URLs that show up in HTML/JS but aren't endpoints — XML namespaces,
 # DTDs, schema identifiers. They get caught by the broad URL regex but they're
 # never resources to fetch.
@@ -1393,6 +1460,8 @@ class Crawler:
         waf_detector: WAFDetector,
         js_only: bool = False,
         verbose: bool = False,
+        analyze_offsite: bool = True,
+        offsite_cap: int = 80,
     ):
         self.target = target
         self.depth = depth
@@ -1405,6 +1474,15 @@ class Crawler:
         self.waf_detector = waf_detector
         self.js_only = js_only
         self.verbose = verbose
+        # Off-site asset policy: an in-scope page's JS is part of its attack surface even
+        # when a CDN (cdn.*, *.cloudfront.net, *.akamaized.net, a design-system host, …)
+        # serves it. When enabled we fetch+analyse those cross-origin JS/JSON bundles for
+        # endpoints/secrets, bounded by `offsite_cap`, but never enqueue off-site HTML into
+        # the BFS. Endpoints extracted are still scope-classified afterwards.
+        self.analyze_offsite = analyze_offsite
+        self.offsite_cap = offsite_cap
+        self._offsite_asset_count = 0
+        self.offsite_assets: List[str] = []
 
         # Discovered state.
         self.visited_pages: Set[str] = set()
@@ -1441,6 +1519,75 @@ class Crawler:
             return urlunsplit((scheme, netloc, path, sp.query, ""))
         except Exception:
             return url
+
+    @staticmethod
+    def _origin(url: str) -> str:
+        """Return scheme://host[:port] for `url` (empty string on garbage)."""
+        try:
+            sp = urlsplit(url)
+            if not sp.hostname:
+                return ""
+            return f"{sp.scheme or 'https'}://{sp.netloc}"
+        except Exception:
+            return ""
+
+    # ---------- off-site asset policy ----------
+
+    def _can_fetch_asset(self, url: str, referer: Optional[str]) -> bool:
+        """True if we may fetch `url` as a code asset (JS/JSON) for endpoint/secret analysis.
+
+        In-scope assets: always. Cross-origin assets: only when off-site analysis is enabled,
+        the referring page/bundle is itself in-scope, and we're under the off-site cap. This
+        lets us read a CDN-hosted bundle that an in-scope page loads (its real attack surface)
+        without wandering the whole internet.
+        """
+        if self.scope.is_excluded(url):
+            return False
+        if self.scope.in_scope(url):
+            return True
+        if not self.analyze_offsite:
+            return False
+        # Don't spend the off-site budget on third-party analytics/ad/consent trackers —
+        # they never host the target's API.
+        if _is_tracker_host(url):
+            return False
+        if not (referer and self.scope.in_scope(referer)):
+            return False
+        with self._lock:
+            return self._offsite_asset_count < self.offsite_cap
+
+    def _claim_offsite_slot(self, url: str) -> bool:
+        """Atomically reserve one off-site-asset slot; False if the cap is already hit."""
+        norm = self._normalise(url)
+        with self._lock:
+            if self._offsite_asset_count >= self.offsite_cap:
+                return False
+            self._offsite_asset_count += 1
+            self.offsite_assets.append(norm)
+            return True
+
+    def _resolve_ep(self, raw: str, js_url: str, referer: Optional[str]) -> str:
+        """Resolve an extracted endpoint to an absolute URL.
+
+        A root-relative "/path" reached from a *cross-origin* bundle is an SPA same-origin
+        call against the page that loaded the bundle — NOT against the CDN that served it —
+        so it resolves against the referring in-scope page origin. Absolute and same-origin
+        references resolve normally.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            return raw
+        if raw.startswith(("http://", "https://", "//")):
+            return urljoin(js_url, raw)
+        if raw.startswith("/"):
+            js_off = not self.scope.in_scope(js_url)
+            if js_off and referer and self.scope.in_scope(referer):
+                base = self._origin(referer)
+                if base:
+                    return urljoin(base + "/", raw.lstrip("/"))
+            return urljoin(js_url, raw)
+        # Bare relative fragment ("api/v2/x") — resolve against the JS file's directory.
+        return urljoin(js_url, raw)
 
     # ---------- recording helpers ----------
 
@@ -1517,21 +1664,30 @@ class Crawler:
             if norm in seen_in_batch:
                 continue
             seen_in_batch.add(norm)
-            if not self.scope.in_scope(norm) or self.scope.is_excluded(norm):
+            if self.scope.is_excluded(norm):
                 continue
 
             if _looks_like_js(norm):
+                # In-scope JS always; cross-origin JS only via the off-site policy (cap +
+                # in-scope referer). fetch_js re-checks and claims the slot atomically.
+                if not self._can_fetch_asset(norm, referer):
+                    if not self.scope.in_scope(norm):
+                        with self._lock:
+                            self.out_of_scope.add(norm)
+                    continue
                 with self._lock:
                     if norm in self.visited_js:
                         continue
-                # fetch_js performs its own atomic visited_js claim and recurses.
                 self.fetch_js(norm, referer=referer)
-            elif _looks_like_manifest_json(norm):
+            elif _looks_like_manifest_json(norm) and self.scope.in_scope(norm):
                 with self._lock:
                     if norm in self.visited_pages:
                         continue
                 # fetch_page's JSON branch handles manifests and calls _follow_assets again.
                 self.fetch_page(norm, referer=referer)
+            elif not self.scope.in_scope(norm):
+                with self._lock:
+                    self.out_of_scope.add(norm)
 
     # ---------- fetch / analyse JS ----------
 
@@ -1546,15 +1702,19 @@ class Crawler:
                 return
             self.visited_js.add(norm)
 
-        if not self.scope.in_scope(norm):
-            with self._lock:
-                self.out_of_scope.add(norm)
-            return
         if self.scope.is_excluded(norm):
             return
+        offsite = not self.scope.in_scope(norm)
+        if offsite:
+            # A CDN-hosted bundle loaded by an in-scope page is analysable code, but bounded:
+            # require the referrer to be in-scope and claim a slot from the off-site cap.
+            if not self._can_fetch_asset(norm, referer) or not self._claim_offsite_slot(norm):
+                with self._lock:
+                    self.out_of_scope.add(norm)
+                return
 
         if self.verbose:
-            logger.debug("JS  %s", norm)
+            logger.debug("JS%s %s", " (off-site)" if offsite else "", norm)
 
         resp = self.client.request("GET", norm, kind="script", referer=referer)
         if not resp or resp.status_code >= 400:
@@ -1571,9 +1731,10 @@ class Crawler:
 
         eps = self.js_analyzer.extract_endpoints(text, norm)
         for ep in eps:
-            # Resolve relative URLs against the JS file's URL.
+            # Root-relative paths from a cross-origin bundle are SPA calls against the page
+            # that loaded it, not the CDN that served it — resolve accordingly (_resolve_ep).
             try:
-                ep.url = urljoin(norm, ep.url)
+                ep.url = self._resolve_ep(ep.url, norm, referer)
             except Exception:
                 pass
             self._record_endpoint(ep)
@@ -1591,8 +1752,10 @@ class Crawler:
             with self._lock:
                 self.graphql_ops.add(op)
 
-        # Recursively fetch any JS chunks / nested manifests this bundle references.
-        self._follow_assets((ep.url for ep in eps), referer=norm)
+        # Recursively fetch any JS chunks / nested manifests this bundle references. Propagate
+        # the original page referer (not this JS URL) so a CDN bundle's sibling chunks stay
+        # reachable and relative paths keep resolving against the in-scope page origin.
+        self._follow_assets((ep.url for ep in eps), referer=referer or norm)
 
         smap = self.js_analyzer.find_source_map(text)
         smap_url = ""
@@ -1738,11 +1901,19 @@ class Crawler:
             # Recursively fetch any JS bundles referenced by inline scripts.
             self._follow_assets((ep.url for ep in eps), referer=norm)
 
-        # External JS (<script src>).
+        # External JS (<script src>). In-scope always; cross-origin bundles (CDN-hosted app
+        # code, e.g. cdn.zeroheight.com) go through the off-site policy so we analyse the same
+        # code the browser actually loads instead of discarding it as out-of-scope.
         scripts = list(parsed["scripts"])
         for src in scripts:
-            if self.scope.in_scope(src) and self._normalise(src) not in self.visited_js:
+            n_src = self._normalise(src)
+            if n_src in self.visited_js:
+                continue
+            if self._can_fetch_asset(n_src, norm):
                 self.fetch_js(src, referer=norm)
+            elif not self.scope.in_scope(src):
+                with self._lock:
+                    self.out_of_scope.add(n_src)
 
         # Data-attribute / extracted URLs.
         for da in parsed["data_attrs"]:
@@ -1872,8 +2043,10 @@ class Crawler:
             for p in self.js_analyzer.extract_parameters(inline):
                 self._record_param(p, f"{target} (inline)", kind="js_extracted")
 
-        # External scripts in parallel.
-        scripts = [s for s in parsed["scripts"] if self.scope.in_scope(s)]
+        # External scripts in parallel — include cross-origin CDN bundles via the off-site
+        # policy (fetch_js re-checks the cap + in-scope-referer per asset before fetching).
+        scripts = [s for s in parsed["scripts"]
+                   if self._can_fetch_asset(self._normalise(s), target)]
         with ThreadPoolExecutor(max_workers=self.threads) as pool:
             futures = [pool.submit(self.fetch_js, s, target) for s in scripts]
             for _ in as_completed(futures):
@@ -2186,6 +2359,7 @@ class ReportGenerator:
                 "bypassed": sum(1 for p in self.path_discovery.waf_blocked_paths if p.bypass_successful),
                 "pages_crawled": len(self.crawler.visited_pages),
                 "js_files_analyzed": len(self.crawler.js_files),
+                "offsite_js_analyzed": len(self.crawler.offsite_assets),
                 "unique_endpoints_found": len(endpoints),
                 "secrets_found": len(self.crawler.secrets),
                 "parameters_found": len(self.crawler.parameters),
@@ -2209,6 +2383,7 @@ class ReportGenerator:
             "source_maps": [asdict(s) for s in self.crawler.source_maps],
             "interesting_findings": self.crawler.interesting,
             "graphql_operations": sorted(self.crawler.graphql_ops),
+            "offsite_assets_analyzed": self.crawler.offsite_assets[:200],
         }
         if self.show_out_of_scope:
             report["out_of_scope_urls"] = sorted(self.crawler.out_of_scope)[:1000]
@@ -2256,6 +2431,9 @@ class ReportGenerator:
               f"{Fore.RED}{s['blocked_by_waf']} blocked{reset})")
         print(f"  Pages crawled  : {s['pages_crawled']}")
         print(f"  JS analysed    : {s['js_files_analyzed']}")
+        if s.get('offsite_js_analyzed'):
+            print(f"  Off-site JS    : {Fore.YELLOW}{s['offsite_js_analyzed']}{reset} "
+                  f"(cross-origin/CDN bundles analysed)")
         print(f"  Endpoints      : {s['unique_endpoints_found']}")
         print(f"  Parameters     : {s['parameters_found']}")
         print(f"  Forms          : {s['forms_found']}")
@@ -2355,10 +2533,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Production-grade bug-bounty reconnaissance crawler.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--target", required=True, help="Base URL to start crawling")
+    p.add_argument("--target", help="Base URL to start crawling")
+    p.add_argument("--targets-file", "-l", default=None,
+                   help="File with one URL per line. Lines starting with # are comments. "
+                        "All targets are scanned and merged into a SINGLE consolidated report.")
     p.add_argument("--depth", type=int, default=5, help="Max crawl depth (default: 5)")
     p.add_argument("--output", default=None,
-                   help="Output JSON path (default: ./report_<domain>_<ts>.json)")
+                   help="Output JSON path. With --targets-file this is the path of the single "
+                        "consolidated report (default: ./report_combined_<ts>.json). "
+                        "Without --targets-file, default is ./report_<domain>_<ts>.json.")
     p.add_argument("--timeout", type=float, default=10.0,
                    help="Per-request timeout in seconds (default: 10)")
     p.add_argument("--threads", type=int, default=10,
@@ -2378,23 +2561,85 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Base delay between requests in seconds (default: 0.5)")
     p.add_argument("--show-out-of-scope", action="store_true",
                    help="Include the out_of_scope_urls list in the JSON report (off by default)")
+    p.add_argument("--no-offsite-js", action="store_true",
+                   help="Do NOT fetch cross-origin (CDN-hosted) JS bundles referenced by "
+                        "in-scope pages. By default such bundles ARE analysed for endpoints / "
+                        "secrets (bounded by --offsite-cap) — that's where modern SPA API "
+                        "routes live (e.g. app code served from cdn.* / *.cloudfront.net).")
+    p.add_argument("--offsite-cap", type=int, default=80,
+                   help="Max cross-origin JS/JSON assets to fetch for code analysis (default: 80)")
     return p.parse_args(argv)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = _parse_args(argv)
+def _load_targets_file(path: str) -> List[str]:
+    """Read targets from a text file. One URL per line; blank lines and `#` comments ignored."""
+    expanded = os.path.expanduser(path)
+    if not os.path.isfile(expanded):
+        raise FileNotFoundError(f"Targets file not found: {expanded}")
+    out: List[str] = []
+    with open(expanded, "r", encoding="utf-8", errors="ignore") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Allow optional leading "- " from yaml-style lists
+            if line.startswith("- "):
+                line = line[2:].strip()
+            out.append(line)
+    return out
 
-    _setup_logger(args.verbose)
 
-    # Validate target.
-    target = args.target.rstrip("/")
+def _normalise_target(raw: str) -> Optional[str]:
+    """Normalise a single target string: add scheme if missing, validate hostname. Returns None on garbage."""
+    target = raw.strip().rstrip("/")
+    if not target:
+        return None
     if not re.match(r"^https?://", target, re.IGNORECASE):
         target = "https://" + target
-    parsed = urlparse(target)
-    if not parsed.hostname:
-        logger.error("Invalid target URL: %s", target)
-        return 2
+    if not urlparse(target).hostname:
+        return None
+    return target
 
+
+def _default_combined_output() -> str:
+    """Default filename for the consolidated multi-target report."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"./report_combined_{ts}.json"
+
+
+def _aggregate_stats(reports: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Sum per-target stat counters into a single combined stats dict."""
+    keys = (
+        "total_requests", "successful", "failed", "blocked_by_waf", "bypassed",
+        "pages_crawled", "js_files_analyzed", "offsite_js_analyzed",
+        "unique_endpoints_found",
+        "secrets_found", "parameters_found", "forms_found",
+        "interesting_paths", "waf_blocked_paths", "soft_404_filtered",
+        "out_of_scope_urls", "graphql_operations", "html_comments",
+        "source_maps_referenced",
+    )
+    out: Dict[str, int] = {k: 0 for k in keys}
+    for r in reports:
+        st = r.get("stats", {})
+        for k in keys:
+            v = st.get(k, 0)
+            if isinstance(v, (int, float)):
+                out[k] += int(v)
+    return out
+
+
+def _run_one_target(
+    target: str,
+    args: argparse.Namespace,
+    output_path: str,
+    *,
+    write_json: bool = True,
+) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """Run the full pipeline (crawl + smart-path discovery + report) for a single target.
+
+    Returns (return_code, report_dict). When `write_json=False` the JSON file is NOT written —
+    the caller is responsible for combining `report_dict` into a consolidated report.
+    """
     # Custom headers.
     custom_headers: Dict[str, str] = {}
     if args.headers:
@@ -2404,7 +2649,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise ValueError("headers must be a JSON object")
         except Exception as exc:
             logger.error("Failed to parse --headers JSON: %s", exc)
-            return 2
+            return 2, None
 
     # Scope.
     extra_scopes = [s for s in (args.scope.split(",") if args.scope else []) if s.strip()]
@@ -2419,7 +2664,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         threads = min(args.threads, 4)
         logger.info("Stealth mode ON — delay >= %.1fs, threads <= %d", base_delay, threads)
 
-    # Build the pipeline.
+    # Build the pipeline (fresh state per target — counters, dedup sets, sessions).
     evader = ProtectionEvader(stealth=args.stealth, base_delay=base_delay)
     waf_detector = WAFDetector()
     client = HTTPClient(evader, waf_detector,
@@ -2432,13 +2677,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         scope=scope, client=client, html_parser=html_parser,
         js_analyzer=js_analyzer, evader=evader, waf_detector=waf_detector,
         js_only=args.js_only, verbose=args.verbose,
+        analyze_offsite=not args.no_offsite_js, offsite_cap=args.offsite_cap,
     )
     path_discovery = SmartPathDiscovery(
         target=target, client=client, scope=scope, evader=evader,
         waf_detector=waf_detector, threads=threads, verbose=args.verbose,
     )
-
-    output_path = os.path.expanduser(args.output) if args.output else _default_output(target)
 
     started = time.time()
     logger.info("Starting bug-hunter crawl on %s (depth=%d, threads=%d)",
@@ -2449,6 +2693,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             path_discovery.run()
     except KeyboardInterrupt:
         logger.warning("Interrupted — writing partial report.")
+        # Re-raise to let main() decide whether to continue with remaining targets.
+        raise
 
     rg = ReportGenerator(
         target=target, crawler=crawler, path_discovery=path_discovery,
@@ -2456,13 +2702,159 @@ def main(argv: Optional[List[str]] = None) -> int:
         started_at=started, show_out_of_scope=args.show_out_of_scope,
     )
     report = rg.build()
-    try:
-        rg.write_json(report, output_path)
-    except Exception as exc:
-        logger.error("Failed to write JSON report: %s", exc)
-        return 1
+    if write_json:
+        try:
+            rg.write_json(report, output_path)
+        except Exception as exc:
+            logger.error("Failed to write JSON report for %s: %s", target, exc)
+            return 1, report
     rg.print_summary(report, output_path)
-    return 0
+    return 0, report
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    _setup_logger(args.verbose)
+
+    # Resolve target list: --targets-file takes precedence; otherwise --target.
+    if not args.target and not args.targets_file:
+        logger.error("Provide either --target <url> or --targets-file <path>.")
+        return 2
+
+    raw_targets: List[str] = []
+    if args.targets_file:
+        try:
+            raw_targets.extend(_load_targets_file(args.targets_file))
+        except Exception as exc:
+            logger.error("Failed to read --targets-file: %s", exc)
+            return 2
+    if args.target:
+        raw_targets.append(args.target)
+
+    if not raw_targets:
+        logger.error("No targets to scan (file empty?).")
+        return 2
+
+    # Normalise + dedupe while preserving order.
+    targets: List[str] = []
+    seen: Set[str] = set()
+    for raw in raw_targets:
+        norm = _normalise_target(raw)
+        if not norm:
+            logger.warning("Skipping invalid target: %r", raw)
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        targets.append(norm)
+
+    if not targets:
+        logger.error("No valid targets after normalisation.")
+        return 2
+
+    # When --targets-file is in play, ALL targets are merged into one consolidated
+    # report file. Without it, each target keeps its own report (and there's only
+    # one anyway, since --target is a single URL).
+    consolidated_mode = bool(args.targets_file)
+
+    if consolidated_mode:
+        consolidated_path = (
+            os.path.expanduser(args.output) if args.output else _default_combined_output()
+        )
+        logger.info("Multi-target mode: %d target(s) -> consolidated report at %s",
+                    len(targets), consolidated_path)
+    else:
+        consolidated_path = ""
+
+    overall_rc = 0
+    per_target_reports: List[Dict[str, Any]] = []
+    batch_started = time.time()
+
+    for idx, target in enumerate(targets, 1):
+        if consolidated_mode:
+            logger.info("=" * 60)
+            logger.info("[%d/%d] Target: %s", idx, len(targets), target)
+            logger.info("=" * 60)
+        if consolidated_mode:
+            # Pass the consolidated path purely so the per-target summary mentions
+            # where the final file will land. The JSON itself is not written yet.
+            out_path = consolidated_path
+            write_json = False
+        else:
+            out_path = (os.path.expanduser(args.output) if args.output
+                        else _default_output(target))
+            write_json = True
+
+        try:
+            rc, report = _run_one_target(target, args, out_path, write_json=write_json)
+        except KeyboardInterrupt:
+            logger.warning("Aborted by user — stopping remaining targets.")
+            if consolidated_mode and per_target_reports:
+                _write_consolidated(consolidated_path, per_target_reports, batch_started,
+                                    show_out_of_scope=args.show_out_of_scope)
+            return 130
+        except Exception as exc:
+            logger.exception("Unhandled error scanning %s: %s", target, exc)
+            rc, report = 1, None
+        if rc != 0:
+            overall_rc = rc
+        if report is not None:
+            per_target_reports.append(report)
+
+    # If we ran with --targets-file, emit one consolidated JSON.
+    if consolidated_mode:
+        try:
+            _write_consolidated(consolidated_path, per_target_reports, batch_started,
+                                show_out_of_scope=args.show_out_of_scope)
+        except Exception as exc:
+            logger.error("Failed to write consolidated report: %s", exc)
+            return 1
+        logger.info("Consolidated report written: %s  (%d target(s))",
+                    consolidated_path, len(per_target_reports))
+
+    return overall_rc
+
+
+def _write_consolidated(
+    path: str,
+    reports: List[Dict[str, Any]],
+    batch_started: float,
+    *,
+    show_out_of_scope: bool,
+) -> None:
+    """Combine per-target reports into a single JSON file at `path`."""
+    elapsed = time.time() - batch_started
+    m, s = divmod(int(elapsed), 60)
+    h, m = divmod(m, 60)
+    if h:
+        duration = f"{h}h {m}m {s}s"
+    elif m:
+        duration = f"{m}m {s}s"
+    else:
+        duration = f"{s}s"
+
+    # Strip the (potentially huge) out_of_scope list from per-target sections unless
+    # the user explicitly opted in via --show-out-of-scope.
+    cleaned_targets: List[Dict[str, Any]] = []
+    for r in reports:
+        rr = dict(r)
+        if not show_out_of_scope:
+            rr.pop("out_of_scope_urls", None)
+        cleaned_targets.append(rr)
+
+    consolidated = {
+        "scan_date": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "scan_duration": duration,
+        "targets_scanned": len(cleaned_targets),
+        "targets_list": [r.get("target", "") for r in cleaned_targets],
+        "aggregated_stats": _aggregate_stats(cleaned_targets),
+        "targets": cleaned_targets,
+    }
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(consolidated, fh, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
