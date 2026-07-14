@@ -1123,7 +1123,9 @@ class HTMLAnalyzer:
                     inline_scripts.append(txt)
 
         # Resource references — skip <img>, <video>, <audio> since they're media
-        # not application surfaces, and image URLs are explicitly filtered out.
+        # not application surfaces. Static assets (images, stylesheets, fonts, media —
+        # e.g. <link rel="stylesheet">) are explicitly filtered out: nothing interesting
+        # lives on them.
         for tag_name, attr in (
             ("link", "href"), ("iframe", "src"),
             ("embed", "src"), ("object", "data"), ("source", "src"),
@@ -1132,7 +1134,7 @@ class HTMLAnalyzer:
                 v = tag.get(attr)
                 if v:
                     full = urljoin(page_url, v.strip())
-                    if not _is_image_url(full):
+                    if not _is_noise_asset(full):
                         links.add(full)
 
         # Forms.
@@ -1365,6 +1367,64 @@ def _is_image_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _IMAGE_EXTS)
 
 
+_CSS_EXTS = (".css", ".css.map")
+
+
+def _is_css_url(url: str) -> bool:
+    """True if `url` points to a stylesheet — CSS carries no security-relevant surface."""
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(path.endswith(ext) for ext in _CSS_EXTS)
+
+
+_FONT_EXTS = (".woff", ".woff2", ".ttf", ".otf", ".eot")
+
+
+def _is_font_url(url: str) -> bool:
+    """True if `url` points to a web font — fonts carry no security-relevant surface."""
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(path.endswith(ext) for ext in _FONT_EXTS)
+
+
+_MEDIA_EXTS = (
+    # video
+    ".mp4", ".webm", ".mov", ".avi", ".mkv", ".m4v", ".ogv", ".flv", ".wmv", ".3gp",
+    # audio
+    ".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a", ".aac", ".opus", ".wma",
+)
+
+
+def _is_media_url(url: str) -> bool:
+    """True if `url` points to an audio/video file — media carry no security-relevant surface.
+
+    Note: documents/archives (.pdf, .zip, .tar, .gz, .xml, .txt) are deliberately NOT here —
+    they can leak PII, secrets, source, or config and are worth keeping in the report.
+    """
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(path.endswith(ext) for ext in _MEDIA_EXTS)
+
+
+def _is_noise_asset(url: str) -> bool:
+    """True if `url` is a static asset with no attack surface worth keeping — images,
+    stylesheets, fonts, and audio/video media. Nothing interesting lives on these, so we
+    never record, crawl, or follow them; they would only bloat the endpoint list and the
+    report."""
+    return (
+        _is_image_url(url)
+        or _is_css_url(url)
+        or _is_font_url(url)
+        or _is_media_url(url)
+    )
+
+
 # Well-known analytics / advertising / tag-manager / consent hosts. When we're allowed to
 # read an in-scope page's *cross-origin* bundles (off-site policy), these are excluded: they
 # are pure third-party trackers, never the target's own API code, so fetching them just burns
@@ -1592,8 +1652,9 @@ class Crawler:
     # ---------- recording helpers ----------
 
     def _record_endpoint(self, ep: EndpointInfo) -> None:
-        # Image URLs are not interesting from a security standpoint and just bloat the report.
-        if _is_image_url(ep.url):
+        # Static assets (images, stylesheets, fonts, media) are not interesting from a
+        # security standpoint and just bloat the report — never record them as endpoints.
+        if _is_noise_asset(ep.url):
             return
         # XML namespace identifiers / DTD URIs aren't real endpoints — drop them.
         if _is_namespace_pseudo_url(ep.url):
@@ -1935,8 +1996,8 @@ class Crawler:
                 full = full.split("#", 1)[0]
             except Exception:
                 continue
-            # Drop image URLs — they're not application surfaces.
-            if _is_image_url(full):
+            # Drop static assets (images, stylesheets, fonts, media) — not app surfaces.
+            if _is_noise_asset(full):
                 continue
             if not self.scope.in_scope(full):
                 with self._lock:
