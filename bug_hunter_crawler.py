@@ -1522,6 +1522,7 @@ class Crawler:
         verbose: bool = False,
         analyze_offsite: bool = True,
         offsite_cap: int = 80,
+        breadth_cap: int = 1000,
     ):
         self.target = target
         self.depth = depth
@@ -1541,6 +1542,10 @@ class Crawler:
         # the BFS. Endpoints extracted are still scope-classified afterwards.
         self.analyze_offsite = analyze_offsite
         self.offsite_cap = offsite_cap
+        # Upper bound on how many URLs one BFS level may hand to the next. A broad site can
+        # emit tens of thousands of links at depth 2-3; without a cap the next level's wall
+        # clock explodes. Trimmed after the shuffle so the kept slice stays a random sample.
+        self.breadth_cap = breadth_cap
         self._offsite_asset_count = 0
         self.offsite_assets: List[str] = []
 
@@ -2068,9 +2073,10 @@ class Crawler:
             next_level_list = list(next_level)
             random.shuffle(next_level_list)
             # Trim to a sane upper bound to avoid runaway breadth.
-            if len(next_level_list) > 5000:
-                logger.warning("Trimming next-level URLs from %d to 5000", len(next_level_list))
-                next_level_list = next_level_list[:5000]
+            if self.breadth_cap > 0 and len(next_level_list) > self.breadth_cap:
+                logger.warning("Trimming next-level URLs from %d to %d",
+                               len(next_level_list), self.breadth_cap)
+                next_level_list = next_level_list[:self.breadth_cap]
             current = set(next_level_list)
 
     def _run_js_only(self) -> None:
@@ -2635,6 +2641,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "routes live (e.g. app code served from cdn.* / *.cloudfront.net).")
     p.add_argument("--offsite-cap", type=int, default=80,
                    help="Max cross-origin JS/JSON assets to fetch for code analysis (default: 80)")
+    p.add_argument("--breadth-cap", type=int, default=1000,
+                   help="Max URLs carried from one crawl depth to the next (default: 1000). "
+                        "Lower it to keep wide sites fast; 0 disables the cap entirely.")
     return p.parse_args(argv)
 
 
@@ -2745,6 +2754,7 @@ def _run_one_target(
         js_analyzer=js_analyzer, evader=evader, waf_detector=waf_detector,
         js_only=args.js_only, verbose=args.verbose,
         analyze_offsite=not args.no_offsite_js, offsite_cap=args.offsite_cap,
+        breadth_cap=args.breadth_cap,
     )
     path_discovery = SmartPathDiscovery(
         target=target, client=client, scope=scope, evader=evader,
