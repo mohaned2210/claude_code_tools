@@ -7,6 +7,8 @@ Update resolvers:
 axiom-exec "curl -fsS -o /tmp/r.txt https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt && test -s /tmp/r.txt && mv /tmp/r.txt /home/op/lists/resolvers.txt"
 ```
 
+
+
 ```
 cat all_subdomain.txt | grep -P "(\.[\w-]+){3}$"
 ```
